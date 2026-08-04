@@ -47,6 +47,7 @@ from pymtl3.stdlib.test_utils import (run_sim,
                                       config_model_with_cmdline_opts)
 
 from ..IntegratedIm2ColWithCgraRTL import IntegratedIm2ColWithCgraRTL
+from ...fu.others.Im2colEngineRTL import pack_im2col_launch
 from ...fu.double.SeqMulAdderRTL import SeqMulAdderRTL
 from ...fu.flexible.FlexibleFuRTL import FlexibleFuRTL
 from ...fu.float.FpAddRTL import FpAddRTL
@@ -146,7 +147,7 @@ class TestHarness(Component):
                 topology, controller2addr_map,
                 idTo2d_map, complete_signal_sink_out,
                 multi_cgra_rows, multi_cgra_columns, src_query_pkt,
-                engine_image, engine_geom, engine_scratch_mem_size):
+                engine_image, engine_scratch_mem_size):
 
     DataAddrType = mk_bits(clog2(data_mem_size_global))
     s.num_tiles  = width * height
@@ -164,10 +165,6 @@ class TestHarness(Component):
         FlexibleFuRTL, FuList, topology,
         controller2addr_map, idTo2d_map,
         engine_scratch_mem_size,
-        engine_geom['in_base'],
-        engine_geom['H'],        engine_geom['W'],
-        engine_geom['kH'],       engine_geom['kW'],
-        engine_geom['stride'],
         engine_image)
 
     cmp_fn = lambda a, b: (a.payload.data == b.payload.data and
@@ -369,12 +366,21 @@ def _run(pe_weights, expected_outputs,
                              DataType, TileInType, FuInType, FuOutType,
                              CTRL_STEPS, pe_weights, expected_outputs)
 
-  # DMA-style trigger: prepend a CMD_IM2COL_LAUNCH packet. The CGRA
-  # controller inspects the payload.cmd and forks this one packet off
-  # to send_to_im2col_engine_pkt (its DMA outport); all other packets
-  # continue into the controller's crossbar as before.
-  launch_pkt = IntraCgraPktType(
-      payload = CgraPayloadType(CMD_IM2COL_LAUNCH))
+  # DMA-style trigger: prepend a CMD_IM2COL_LAUNCH packet whose fields
+  # carry the runtime im2col config. The controller forwards this single
+  # packet to send_to_im2col_engine_pkt; the engine parses the packed
+  # fields on the IDLE->READ edge.
+  launch_data = pack_im2col_launch(
+      H       = engine_geom['H'],
+      W       = engine_geom['W'],
+      in_base = engine_geom['in_base'],
+      kH      = engine_geom['kH'],
+      kW      = engine_geom['kW'],
+      stride  = engine_geom['stride'])
+  launch_pkt = IntraCgraPktType(payload = CgraPayloadType(
+      CMD_IM2COL_LAUNCH,
+      data      = DataType(launch_data, 1),
+      data_addr = engine_geom['dest_base']))
   src_ctrl_pkt = [launch_pkt] + src_ctrl_pkt
 
   th = TestHarness(FULL_FU_LIST, IntraCgraPktType, CgraPayloadType, DataType,
@@ -387,7 +393,7 @@ def _run(pe_weights, expected_outputs,
                    CONTROLLER2ADDR_MAP, ID_TO_2D_MAP,
                    complete_signal_sink_out,
                    NUM_CGRA_ROWS, NUM_CGRA_COLUMNS, src_query_pkt,
-                   engine_image, engine_geom, ENGINE_SCRATCH_MEM_SIZE)
+                   engine_image, ENGINE_SCRATCH_MEM_SIZE)
 
   th.elaborate()
   th.dut.set_metadata(VerilogVerilatorImportPass.vl_Wno_list,
@@ -405,7 +411,7 @@ def test_im2col_to_systolic_3x3(cmdline_opts):
   # Engine inputs: image + geometry chosen so lowered matrix == [1,2,3,4],
   # i.e. the same activation values the original systolic test preloads.
   engine_image       = [1, 3, 2, 4]
-  engine_geom        = dict(in_base = 0,
+  engine_geom        = dict(in_base = 0, dest_base = 0,
                             H = 1, W = 4, kH = 1, kW = 2, stride = 2)
 
   # Original systolic weights and expected outputs (verbatim from
@@ -447,7 +453,7 @@ def test_im2col_conv1d_to_systolic_3x3(cmdline_opts):
   pe_weights = {7: filters[0][0], 4: filters[0][1],
                 8: filters[1][0], 5: filters[1][1]}
 
-  engine_geom       = dict(in_base = 0,
+  engine_geom       = dict(in_base = 0, dest_base = 0,
                            H = H, W = W, kH = kH, kW = kW, stride = stride)
 
   _run(pe_weights, expected_outputs,
@@ -476,13 +482,10 @@ def _make_dut():
       True,                         # mem_access_is_combinational
       FlexibleFuRTL, COMPACT_FU_LIST, TOPOLOGY,
       CONTROLLER2ADDR_MAP, ID_TO_2D_MAP,
-      # Im2col engine parameters (same geometry as
-      # test_im2col_to_systolic_3x3 -- image [1,3,2,4] with 1x2 kernel
-      # stride 2 lowers to [1,2,3,4]).
+      # Im2col engine: only scratch size and preload image are needed at
+      # construct time; all geometry is runtime-configured via the
+      # CMD_IM2COL_LAUNCH packet.
       engine_scratch_mem_size = ENGINE_SCRATCH_MEM_SIZE,
-      engine_in_base = 0,
-      engine_H = 1, engine_W = 4,
-      engine_kH = 1, engine_kW = 2, engine_stride = 2,
       engine_preload_image = [1, 3, 2, 4])
 
 

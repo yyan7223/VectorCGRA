@@ -9,15 +9,16 @@ its own dedicated packet ports on the controller.
 
 The launch flow: a CPU-issued IntraCgraPkt with cmd = CMD_IM2COL_LAUNCH
 enters the controller through recv_from_cpu_pkt; the controller
-recognizes the cmd and forwards the packet on send_to_im2col_engine_pkt
-to trigger engine.start. The engine then reads the preloaded image
-from its input scratchpad, computes im2col, and streams the lowered
-(kH*kW) x (Hout*Wout) matrix into the CGRA's data memory as a sequence
-of CMD_STORE_REQUEST packets that enter the controller through the
-engine-dedicated recv_from_im2col_pkt (a separate port so its source is
-obvious at the interface level). Both packet streams reach the same
-internal crossbar, so they still share downstream routing to data_mem
-/ ctrl_ring / NoC.
+recognizes the cmd and forwards the whole packet on
+send_to_im2col_engine_pkt to the engine's recv_cmd_pkt port. The engine
+parses the packet's packed fields (H, W, kH, kW, log2_stride, in_base,
+dest_base) and starts computing im2col on the preloaded image. The
+lowered (kH*kW) x (Hout*Wout) matrix is streamed into the CGRA's data
+memory as a sequence of CMD_STORE_REQUEST packets that enter the
+controller through the engine-dedicated recv_from_im2col_pkt (a
+separate port so its source is obvious at the interface level). Both
+packet streams reach the same internal crossbar, so they still share
+downstream routing to data_mem / ctrl_ring / NoC.
 
 Architecture:
 
@@ -71,10 +72,12 @@ class IntegratedIm2ColWithCgraRTL(Component):
                 total_steps, mem_access_is_combinational,
                 FunctionUnit, FuList, cgra_topology,
                 controller2addr_map, idTo2d_map,
-                # Im2col engine parameters (geometry + per-cell routing).
+                # Im2col engine parameters. All geometry (H, W, kH, kW,
+                # stride, in_base, dest_base) is now runtime-configured
+                # via the CMD_IM2COL_LAUNCH packet fields; only the
+                # scratchpad size and the (test-only) preload image
+                # remain at construct time.
                 engine_scratch_mem_size,
-                engine_in_base,
-                engine_H, engine_W, engine_kH, engine_kW, engine_stride,
                 engine_preload_image,
                 has_ctrl_ring = True):
 
@@ -116,8 +119,6 @@ class IntegratedIm2ColWithCgraRTL(Component):
     s.engine = Im2colEngineRTL(
         DataType, CtrlPktType, CgraPayloadType,
         engine_scratch_mem_size,
-        engine_in_base,
-        engine_H, engine_W, engine_kH, engine_kW, engine_stride,
         engine_preload_image)
 
     s.cgra = CgraRTL(CgraPayloadType,
@@ -132,12 +133,10 @@ class IntegratedIm2ColWithCgraRTL(Component):
                      has_ctrl_ring = has_ctrl_ring,
                      has_im2col_engine = True)
 
-    # DMA-style trigger. The CGRA controller forks packets whose
-    # payload.cmd == CMD_IM2COL_LAUNCH to send_to_im2col_engine_pkt;
-    # we drive engine.start with the val of that stream (one-cycle
-    # pulse) and always acknowledge with rdy=1.
-    s.engine.start                       //= s.cgra.send_to_im2col_engine_pkt.val
-    s.cgra.send_to_im2col_engine_pkt.rdy //= 1
+    # DMA-style trigger. The controller forwards the full LAUNCH packet
+    # (which now carries runtime config in its fields) directly to the
+    # engine's recv_cmd_pkt port.
+    s.engine.recv_cmd_pkt //= s.cgra.send_to_im2col_engine_pkt
 
     # Pass-through wiring to CgraRTL.
     s.cgra.cgra_id       //= s.cgra_id
@@ -177,12 +176,11 @@ class IntegratedIm2ColWithCgraRTL(Component):
     # and without this gate the tile launches would race the engine's
     # store requests and execute against un-preloaded SRAM.
     #
-    # `engine_active` rises on engine.start (the cycle we fork
-    # CMD_IM2COL_LAUNCH to the engine) and clears on engine.done. While
-    # high, the CPU-facing recv_from_cpu_pkt is held (rdy=0) so
-    # subsequent CPU packets wait. The engine's dedicated
-    # recv_from_im2col_pkt is unaffected -- it carries the preload
-    # stream freely.
+    # `engine_active` rises on the LAUNCH handshake (val & rdy on the
+    # engine's recv_cmd_pkt) and clears on engine.done. While high, the
+    # CPU-facing recv_from_cpu_pkt is held (rdy=0) so subsequent CPU
+    # packets wait. The engine's dedicated recv_from_im2col_pkt is
+    # unaffected -- it carries the preload stream freely.
     s.engine.send_pkt //= s.cgra.recv_from_im2col_pkt
 
     s.engine_active = Wire(b1)
@@ -192,7 +190,7 @@ class IntegratedIm2ColWithCgraRTL(Component):
       if s.reset:
         s.engine_active <<= b1(0)
       else:
-        if s.engine.start:
+        if s.engine.recv_cmd_pkt.val & s.engine.recv_cmd_pkt.rdy:
           s.engine_active <<= b1(1)
         elif s.engine.done:
           s.engine_active <<= b1(0)
