@@ -7,34 +7,35 @@ DMA-style topology: the CPU only talks to the CGRA controller, and the
 Im2col engine sits behind the controller like a DMA peripheral, with
 its own dedicated packet ports on the controller.
 
-The launch flow: a CPU-issued IntraCgraPkt with cmd = CMD_IM2COL_LAUNCH
-enters the controller through recv_from_cpu_pkt; the controller
-recognizes the cmd and forwards the whole packet on
-send_to_im2col_engine_pkt to the engine's recv_cmd_pkt port. The engine
-parses the packet's packed fields (H, W, kH, kW, log2_stride, in_base,
-dest_base) and starts computing im2col on the preloaded image. The
-lowered (kH*kW) x (Hout*Wout) matrix is streamed into the CGRA's data
-memory as a sequence of CMD_STORE_REQUEST packets that enter the
-controller through the engine-dedicated recv_from_im2col_pkt (a
-separate port so its source is obvious at the interface level). Both
-packet streams reach the same internal crossbar, so they still share
-downstream routing to data_mem / ctrl_ring / NoC.
+The launch flow: the CPU sends a series of CMD_IM2COL_* CONFIG packets
+(H, W, kH, kW, log2_stride, dst_sram_base) followed by
+CMD_IM2COL_LAUNCH through recv_from_cpu_pkt. The controller forwards
+every one of these packets on send_to_im2col_engine_pkt to the
+engine's recv_cmd_pkt port; the engine latches each CONFIG value into
+its corresponding register while in S_IDLE, and starts processing on
+LAUNCH. The lowered (kH*kW) x (Hout*Wout) matrix is streamed into the
+CGRA's data memory as a sequence of CMD_STORE_REQUEST packets that
+enter the controller through the engine-dedicated recv_from_im2col_pkt
+(a separate port so its source is obvious at the interface level).
+Both packet streams reach the same internal crossbar, so they still
+share downstream routing to data_mem / ctrl_ring / NoC.
 
 Architecture:
 
     +----------------- IntegratedIm2ColWithCgraRTL --------------------+
     |                                                                  |
     |  recv_from_cpu_pkt --------> cgra.recv_from_cpu_pkt              |
-    |  (CPU: config / launch /                |                        |
-    |   query / CMD_IM2COL_LAUNCH)            |                        |
-    |                                         |  send_to_im2col_       |
+    |  (CPU: tile config /                    |                        |
+    |   query / CMD_IM2COL_* CONFIG           |                        |
+    |   + CMD_IM2COL_LAUNCH)                  |  send_to_im2col_       |
     |                                         |  engine_pkt (fork of   |
-    |                                         |  CMD_IM2COL_LAUNCH)    |
+    |                                         |  CMD_IM2COL_* CONFIG   |
+    |                                         |  and CMD_IM2COL_LAUNCH)|
     |                                         v                        |
-    |                                  +------+----------+             |
-    |                                  |  Im2colEngineRTL |             |
-    |                                  |  (Im2col +       |             |
-    |                                  |   scratchpads +  |             |
+    |                                  +------+---------+              |
+    |                                  |  Im2colEngineRTL|              |
+    |                                  |  (im2col + in_mem|             |
+    |                                  |   scratchpad +   |             |
     |                                  |   emit FSM)      |             |
     |                                  +--------+---------+             |
     |                                           | engine.send_pkt       |
@@ -54,11 +55,12 @@ from .CgraRTL import CgraRTL
 from ..fu.others.Im2colEngineRTL import Im2colEngineRTL
 from ..lib.basic.val_rdy.ifcs import ValRdyRecvIfcRTL as RecvIfcRTL
 from ..lib.basic.val_rdy.ifcs import ValRdySendIfcRTL as SendIfcRTL
+from ..lib.cmd_type import CMD_IM2COL_LAUNCH
 from ..lib.messages import (mk_cgra_id_type, mk_inter_cgra_pkt,
                             mk_intra_cgra_pkt)
 from ..lib.util.common import KING_MESH, MESH
-from ..lib.util.data_struct_attr import (kAttrCtrl, kAttrData, kAttrDataAddr,
-                                          kAttrPayload)
+from ..lib.util.data_struct_attr import (kAttrCmd, kAttrCtrl, kAttrData,
+                                          kAttrDataAddr, kAttrPayload)
 
 
 class IntegratedIm2ColWithCgraRTL(Component):
@@ -73,9 +75,9 @@ class IntegratedIm2ColWithCgraRTL(Component):
                 FunctionUnit, FuList, cgra_topology,
                 controller2addr_map, idTo2d_map,
                 # Im2col engine parameters. All geometry (H, W, kH, kW,
-                # stride, in_base, dest_base) is now runtime-configured
-                # via the CMD_IM2COL_LAUNCH packet fields; only the
-                # scratchpad size and the (test-only) preload image
+                # log2_stride, dst_sram_base_addr) is runtime-configured
+                # via CMD_IM2COL_* CONFIG packets before LAUNCH; only
+                # the scratchpad size and the (test-only) preload image
                 # remain at construct time.
                 engine_scratch_mem_size,
                 engine_preload_image,
@@ -185,12 +187,19 @@ class IntegratedIm2ColWithCgraRTL(Component):
 
     s.engine_active = Wire(b1)
 
+    CmdType = CgraPayloadType.get_field_type(kAttrCmd)
+
     @update_ff
     def update_engine_active():
       if s.reset:
         s.engine_active <<= b1(0)
       else:
-        if s.engine.recv_cmd_pkt.val & s.engine.recv_cmd_pkt.rdy:
+        # Only the LAUNCH handshake activates the engine; the preceding
+        # CONFIG handshakes stay in S_IDLE and must not gate the CPU
+        # stream.
+        if s.engine.recv_cmd_pkt.val & s.engine.recv_cmd_pkt.rdy & (
+            s.engine.recv_cmd_pkt.msg.payload.cmd
+            == CmdType(CMD_IM2COL_LAUNCH)):
           s.engine_active <<= b1(1)
         elif s.engine.done:
           s.engine_active <<= b1(0)

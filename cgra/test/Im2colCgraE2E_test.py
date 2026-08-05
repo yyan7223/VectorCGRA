@@ -47,7 +47,6 @@ from pymtl3.stdlib.test_utils import (run_sim,
                                       config_model_with_cmdline_opts)
 
 from ..IntegratedIm2ColWithCgraRTL import IntegratedIm2ColWithCgraRTL
-from ...fu.others.Im2colEngineRTL import pack_im2col_launch
 from ...fu.double.SeqMulAdderRTL import SeqMulAdderRTL
 from ...fu.flexible.FlexibleFuRTL import FlexibleFuRTL
 from ...fu.float.FpAddRTL import FpAddRTL
@@ -356,6 +355,36 @@ def build_systolic_packets(IntraCgraPktType, CgraPayloadType, CtrlType,
 # Common CGRA / mesh parameters and harness driver.
 #-------------------------------------------------------------------------
 
+def _make_im2col_prologue(engine_geom):
+  """Build the CONFIG + LAUNCH packet sequence for the im2col engine.
+
+  Mirrors CMD_DMA_CONFIG_* style: one CMD per geometry parameter, then
+  CMD_IM2COL_LAUNCH to start. Stride is passed as log2(stride).
+  """
+  stride      = engine_geom['stride']
+  log2_stride = stride.bit_length() - 1
+  assert (1 << log2_stride) == stride, \
+      f"stride={stride} must be a power of two"
+
+  def cfg_data(cmd, value):
+    return IntraCgraPktType(payload = CgraPayloadType(
+        cmd, data = DataType(value, 1)))
+
+  def cfg_addr(cmd, value):
+    return IntraCgraPktType(payload = CgraPayloadType(
+        cmd, data_addr = value))
+
+  return [
+      cfg_data(CMD_IM2COL_H,             engine_geom['H']),
+      cfg_data(CMD_IM2COL_W,             engine_geom['W']),
+      cfg_data(CMD_IM2COL_KH,            engine_geom['kH']),
+      cfg_data(CMD_IM2COL_KW,            engine_geom['kW']),
+      cfg_data(CMD_IM2COL_LOG2_STRIDE,   log2_stride),
+      cfg_addr(CMD_IM2COL_DST_SRAM_BASE, engine_geom['dst_sram_base_addr']),
+      IntraCgraPktType(payload = CgraPayloadType(CMD_IM2COL_LAUNCH)),
+  ]
+
+
 def _run(pe_weights, expected_outputs,
          engine_image, engine_geom,
          cmdline_opts):
@@ -366,22 +395,10 @@ def _run(pe_weights, expected_outputs,
                              DataType, TileInType, FuInType, FuOutType,
                              CTRL_STEPS, pe_weights, expected_outputs)
 
-  # DMA-style trigger: prepend a CMD_IM2COL_LAUNCH packet whose fields
-  # carry the runtime im2col config. The controller forwards this single
-  # packet to send_to_im2col_engine_pkt; the engine parses the packed
-  # fields on the IDLE->READ edge.
-  launch_data = pack_im2col_launch(
-      H       = engine_geom['H'],
-      W       = engine_geom['W'],
-      in_base = engine_geom['in_base'],
-      kH      = engine_geom['kH'],
-      kW      = engine_geom['kW'],
-      stride  = engine_geom['stride'])
-  launch_pkt = IntraCgraPktType(payload = CgraPayloadType(
-      CMD_IM2COL_LAUNCH,
-      data      = DataType(launch_data, 1),
-      data_addr = engine_geom['dest_base']))
-  src_ctrl_pkt = [launch_pkt] + src_ctrl_pkt
+  # Prepend the im2col CONFIG + LAUNCH sequence. The controller forks
+  # each of these packets to send_to_im2col_engine_pkt; the engine
+  # latches config values in S_IDLE and starts on LAUNCH.
+  src_ctrl_pkt = _make_im2col_prologue(engine_geom) + src_ctrl_pkt
 
   th = TestHarness(FULL_FU_LIST, IntraCgraPktType, CgraPayloadType, DataType,
                    cgra_id, X_TILES, Y_TILES,
@@ -411,7 +428,7 @@ def test_im2col_to_systolic_3x3(cmdline_opts):
   # Engine inputs: image + geometry chosen so lowered matrix == [1,2,3,4],
   # i.e. the same activation values the original systolic test preloads.
   engine_image       = [1, 3, 2, 4]
-  engine_geom        = dict(in_base = 0, dest_base = 0,
+  engine_geom        = dict(dst_sram_base_addr = 0,
                             H = 1, W = 4, kH = 1, kW = 2, stride = 2)
 
   # Original systolic weights and expected outputs (verbatim from
@@ -453,7 +470,7 @@ def test_im2col_conv1d_to_systolic_3x3(cmdline_opts):
   pe_weights = {7: filters[0][0], 4: filters[0][1],
                 8: filters[1][0], 5: filters[1][1]}
 
-  engine_geom       = dict(in_base = 0, dest_base = 0,
+  engine_geom       = dict(dst_sram_base_addr = 0,
                            H = H, W = W, kH = kH, kW = kW, stride = stride)
 
   _run(pe_weights, expected_outputs,
