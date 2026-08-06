@@ -355,7 +355,7 @@ def build_systolic_packets(IntraCgraPktType, CgraPayloadType, CtrlType,
 # Common CGRA / mesh parameters and harness driver.
 #-------------------------------------------------------------------------
 
-def _make_im2col_prologue(engine_geom):
+def _make_im2col_prepare_cmds(engine_geom):
   """Build the CONFIG + LAUNCH packet sequence for the im2col engine.
 
   Mirrors CMD_DMA_CONFIG_* style: one CMD per geometry parameter, then
@@ -398,7 +398,7 @@ def _run(pe_weights, expected_outputs,
   # Prepend the im2col CONFIG + LAUNCH sequence. The controller forks
   # each of these packets to send_to_im2col_engine_pkt; the engine
   # latches config values in S_IDLE and starts on LAUNCH.
-  src_ctrl_pkt = _make_im2col_prologue(engine_geom) + src_ctrl_pkt
+  src_ctrl_pkt = _make_im2col_prepare_cmds(engine_geom) + src_ctrl_pkt
 
   th = TestHarness(FULL_FU_LIST, IntraCgraPktType, CgraPayloadType, DataType,
                    cgra_id, X_TILES, Y_TILES,
