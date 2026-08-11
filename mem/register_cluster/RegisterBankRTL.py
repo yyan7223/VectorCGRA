@@ -8,6 +8,10 @@ multiple registers that can be indexed/picked for read/write. Each has
 one write port (from routing crossbar, fu crossbar, or const) and two
 read ports (one towards FU, one towards routing crossbar).
 
+Terminology: a "ctrl step" is one dynamic execution of one ctrl word;
+it spans one or more cycles and completes on the `inport_ctrl_proceed`
+pulse (when all of the tile's consumers have been served).
+
 Each register entry tracks whether it holds an unconsumed token
 (https://github.com/tancheng/VectorCGRA/issues/321). Token discipline
 applies to "armed" registers, i.e., registers that have been written at
@@ -118,16 +122,22 @@ class RegisterBankRTL(Component):
     s.read_towards_xbar = Wire(1)
     s.read_token_valid = Wire(1)
     s.read_armed = Wire(1)
-    # Token status of the configured write target and of the skid
-    # entry's target.
-    s.wr_target_token = Wire(1)
-    s.skid_target_token = Wire(1)
-    # The current ctrl step is reading the write target / the skid
-    # entry's target. A register being read must stay stable until the
-    # step completes (reads are level signals), so such writes park in
-    # the skid and commit exactly when the step completes.
-    s.wr_target_read = Wire(1)
-    s.skid_target_read = Wire(1)
+    # Whether the register targeted by the incoming write / by the
+    # parked skid entry still holds its old, unconsumed token (i.e.,
+    # token_valid[write_reg_idx] / token_valid[skid_idx]). "target"
+    # refers to the destination register, never to the value being
+    # written; the two targets can differ, since the skid entry may
+    # have been parked by an earlier ctrl step.
+    s.wr_target_holds_token = Wire(1)
+    s.skid_target_holds_token = Wire(1)
+    # Hazard flags: the current ctrl step is reading the register that
+    # the incoming write / the parked skid entry targets. A register
+    # being read must stay stable until the step completes (reads are
+    # level signals), so such writes park in the skid and commit
+    # exactly when the step completes. Note data is never read *from*
+    # the skid: reads always come from the register file.
+    s.wr_target_being_read = Wire(1)
+    s.skid_target_being_read = Wire(1)
     # The skid entry commits into the register file this cycle.
     s.skid_commit = Wire(1)
     # A write is accepted from the selected source this cycle...
@@ -156,21 +166,21 @@ class RegisterBankRTL(Component):
       # skid entry's target.
       s.read_token_valid @= 0
       s.read_armed @= 0
-      s.wr_target_token @= 0
-      s.skid_target_token @= 0
+      s.wr_target_holds_token @= 0
+      s.skid_target_holds_token @= 0
       for r in range(num_registers):
         if s.inport_opt.read_reg_idx[reg_bank_id] == r:
           s.read_token_valid @= s.token_valid[r]
           s.read_armed @= s.armed[r]
         if s.inport_opt.write_reg_idx[reg_bank_id] == r:
-          s.wr_target_token @= s.token_valid[r]
+          s.wr_target_holds_token @= s.token_valid[r]
         if s.skid_idx == r:
-          s.skid_target_token @= s.token_valid[r]
+          s.skid_target_holds_token @= s.token_valid[r]
 
-      s.wr_target_read @= (s.read_towards_fu | s.read_towards_xbar) & \
+      s.wr_target_being_read @= (s.read_towards_fu | s.read_towards_xbar) & \
           (s.inport_opt.read_reg_idx[reg_bank_id] == \
            s.inport_opt.write_reg_idx[reg_bank_id])
-      s.skid_target_read @= (s.read_towards_fu | s.read_towards_xbar) & \
+      s.skid_target_being_read @= (s.read_towards_fu | s.read_towards_xbar) & \
           (s.inport_opt.read_reg_idx[reg_bank_id] == s.skid_idx)
 
       # The parked write drains into the register file as soon as this
@@ -179,8 +189,8 @@ class RegisterBankRTL(Component):
       # completes (its new token atomically replaces the one the step
       # consumes); otherwise it happens once the target holds no token.
       s.skid_commit @= s.skid_valid & \
-          ((s.skid_target_read & s.inport_ctrl_proceed) | \
-           (~s.skid_target_read & ~s.skid_target_token))
+          ((s.skid_target_being_read & s.inport_ctrl_proceed) | \
+           (~s.skid_target_being_read & ~s.skid_target_holds_token))
 
       # A write is accepted whenever the skid buffer is free: it lands
       # directly in the register file if that cannot disturb anything,
@@ -228,8 +238,8 @@ class RegisterBankRTL(Component):
           # (the write lands at the step boundary; a consumed token is
           # atomically replaced since set wins over clear). Otherwise
           # parks in the skid buffer.
-          if (~s.wr_target_token & ~s.wr_target_read) | \
-             (s.wr_target_read & s.inport_ctrl_proceed):
+          if (~s.wr_target_holds_token & ~s.wr_target_being_read) | \
+             (s.wr_target_being_read & s.inport_ctrl_proceed):
             s.wr_en @= 1
           else:
             s.skid_park @= 1
