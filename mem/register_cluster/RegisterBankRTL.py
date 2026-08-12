@@ -30,17 +30,22 @@ writes). For an armed register:
   (e.g., VectorAllReduceRTL's base operand), and for
   read_reg_towards=BOTH the tile only lets the step complete once both
   the FU and the routing-crossbar paths have been served.
-- A write targeting a register that still holds an unconsumed token, or
-  that is being read by the current ctrl step, is accepted into a
-  one-entry write skid buffer (if free) and committed into the register
-  file once this cannot disturb an in-flight read, so an earlier token
-  can never be silently overwritten and a register being read stays
-  stable until the step completes — while a producer whose destination
-  register is being read by its own ctrl step (same-register
-  read-modify-write, e.g. an accumulator, or `NOT $0 -> $0, SOUTH`
-  under backpressure, see issues #281/#286) can still complete its
-  write handshake and let the step finish. Only while the skid buffer
-  is occupied are writes backpressured (via `outport_wr_rdy`).
+- A write targeting a register that still holds an unconsumed token is
+  backpressured (via `outport_wr_rdy`), so an earlier token can never
+  be silently overwritten.
+- A write whose target is being read by its own ctrl step
+  (same-register read-modify-write, e.g. an accumulator, or
+  `NOT $0 -> $0, SOUTH` under backpressure, see issues #281/#286)
+  cannot land mid-step without corrupting the in-flight read, and
+  cannot be backpressured either without deadlocking (the step only
+  completes once the write is delivered). Such a write is instead
+  accepted into a one-entry write skid buffer, and committed into the
+  register file at the step boundary -- or written through directly on
+  the `inport_ctrl_proceed` pulse, so an accumulator still runs at full
+  rate. The register keeps its old value for any re-reads until the
+  step completes.
+  Backpressure for every other flow is unchanged, so kernels that do
+  not use this pattern see exactly the pre-existing behavior.
 
 Author : Cheng Tan
   Date : Feb 6, 2025
@@ -104,15 +109,18 @@ class RegisterBankRTL(Component):
     # configured read (acting as a default-token source).
     s.armed = Wire(num_registers)
     # Write skid buffer (one entry; the bank has one write port, so at
-    # most one write can be blocked at a time). A write that cannot land
-    # directly is accepted ("parked") here and committed into the
-    # register file once that cannot disturb an in-flight read. This is
-    # what allows an operation to read and write the same register
-    # within one ctrl step (e.g., an accumulator, or `NOT $0 -> $0,
-    # SOUTH` under backpressure — see issues #281/#286): the producer's
-    # write handshake completes immediately via the skid, so the step
-    # can finish and release the old token, while the register keeps
-    # the old value stable for any re-reads until the step completes.
+    # most one such write can be in flight at a time). It is used only
+    # for a write whose target register is being read by its own ctrl
+    # step (same-register read-modify-write, e.g. an accumulator, or
+    # `NOT $0 -> $0, SOUTH` under backpressure — see issues #281/#286).
+    # That write can neither land mid-step (it would corrupt the
+    # in-flight read) nor be backpressured (the step only completes once
+    # it is delivered), so it is parked here: the producer's write
+    # handshake completes immediately, the step can finish and release
+    # the old token, and the parked value lands at the step boundary
+    # while the register stays stable for any re-reads.
+    # Every other write keeps the pre-existing behavior: land directly
+    # when the target holds no unconsumed token, otherwise backpressure.
     s.skid_valid = Wire(1)
     s.skid_data = Wire(DataType)
     s.skid_idx = Wire(AddrType)
@@ -192,16 +200,23 @@ class RegisterBankRTL(Component):
           ((s.skid_target_being_read & s.inport_ctrl_proceed) | \
            (~s.skid_target_being_read & ~s.skid_target_holds_token))
 
-      # A write is accepted whenever the skid buffer is free: it lands
-      # directly in the register file if that cannot disturb anything,
-      # and parks in the skid otherwise. Occupied skid -> not ready.
-      # Keeping this a pure function of registered state means the
-      # producer's rdy never combinationally depends on any consumer's
+      # A write is accepted when it can land directly -- target holds no
+      # unconsumed token and is not being read by the current step --
+      # which is exactly the pre-existing acceptance condition, so
+      # backpressure toward producers is unchanged for every flow that
+      # already worked. The skid buffer is used only for the case that
+      # otherwise deadlocks: a write whose target is being read by its
+      # own ctrl step (same-register read-modify-write), which is
+      # accepted while the skid is free and committed at the step
+      # boundary.
+      # All terms are registered state or ctrl-word fields, so the
+      # producer's rdy never combinationally depends on a consumer's
       # readiness (in particular not on skid_commit, which derives from
-      # inport_ctrl_proceed and would otherwise close a loop through
-      # the FU's rdy chain), and it also guarantees a direct write can
-      # never collide with a skid commit on the single write port.
-      s.outport_wr_rdy @= ~s.skid_valid
+      # inport_ctrl_proceed and would otherwise close a loop through the
+      # FU's rdy chain), and a direct write can never collide with a
+      # skid commit on the single write port.
+      s.outport_wr_rdy @= (~s.wr_target_holds_token & ~s.wr_target_being_read) | \
+                          (s.wr_target_being_read & ~s.skid_valid)
 
     @update
     def access_registers():
